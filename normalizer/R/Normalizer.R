@@ -15,7 +15,10 @@
 #'     each column using column mean and standard deviation (`robust = FALSE`)
 #'     or column median and MAD (`robust = TRUE`), falling back to standard
 #'     deviation when MAD is non-finite/zero and setting zero/non-finite
-#'     dispersion to `1` with a warning.
+#'     dispersion to `1` with a warning. The two steps can be switched off
+#'     independently: `center = FALSE` skips the subtraction of the center
+#'     (`z = x / s`), `scale = FALSE` skips the division by the dispersion
+#'     (`z = x - mu`); with both `FALSE` the data are left unchanged.
 #'   \item **Min-max scaling (`method = "min_max"`):** rescales each column
 #'     using observed column minimum and maximum (`lo` and `hi`), setting range
 #'     to `1` with a warning when a column has zero range.
@@ -47,6 +50,8 @@ Normalizer <- R6::R6Class(
   private = list(
     .method = "z_score",
     .robust = FALSE,
+    .center = TRUE,
+    .scale  = TRUE,
     .state = NULL,
     .was_vector = FALSE,
 
@@ -85,41 +90,48 @@ Normalizer <- R6::R6Class(
 
     # Compute z-score or robust (median/MAD) standardization and return the scaling parameters
     to_z_score = function(x) {
+      p <- ncol(x)
       all_na <- colSums(!is.na(x)) == 0L
 
-      if (private$.robust) {
-        mu <- matrixStats::colMedians(x, na.rm = TRUE)
-        s  <- matrixStats::colMads(x, center = mu, na.rm = TRUE)
+      mu <- if (private$.robust) matrixStats::colMedians(x, na.rm = TRUE) else matrixStats::colMeans2(x, na.rm = TRUE)
+      s  <- rep(1, p)
 
-        # Fallback to stand. dev. where MAD is unusable and the sd is valid
+      if (private$.scale) {
+        if (private$.robust) {
+          s <- matrixStats::colMads(x, center = mu, na.rm = TRUE)
+
+          # Fallback to stand. dev. where MAD is unusable and the sd is valid
+          bad <- which(!all_na & (!is.finite(s) | s <= 0))
+          if (length(bad) > 0L) {
+            s_sd <- matrixStats::colSds(x[, bad, drop = FALSE], na.rm = TRUE)
+            fb   <- is.finite(s_sd) & s_sd > 0
+            if (any(fb)) {
+              warning(sprintf("MAD is zero or not finite in column(s) %s; falling back to the standard deviation.",
+                              private$col_labels(x, bad[fb])), call. = FALSE)
+              s[bad[fb]] <- s_sd[fb]
+            }
+          }
+        } else {
+          s <- matrixStats::colSds(x, na.rm = TRUE)
+        }
+
         bad <- which(!all_na & (!is.finite(s) | s <= 0))
         if (length(bad) > 0L) {
-          s_sd <- matrixStats::colSds(x[, bad, drop = FALSE], na.rm = TRUE)
-          fb   <- is.finite(s_sd) & s_sd > 0
-          if (any(fb)) {
-            warning(sprintf("MAD is zero or not finite in column(s) %s; falling back to the standard deviation.",
-                            private$col_labels(x, bad[fb])), call. = FALSE)
-            s[bad[fb]] <- s_sd[fb]
-          }
+          warning(sprintf("Dispersion is zero or not computable (constant or single-value series) in column(s) %s. Scale set to 1 to avoid zero division.",
+                          private$col_labels(x, bad)), call. = FALSE)
+          s[bad] <- 1
         }
-      } else {
-        mu <- matrixStats::colMeans2(x, na.rm = TRUE)
-        s  <- matrixStats::colSds(x, na.rm = TRUE)
       }
 
-      bad <- which(!all_na & (!is.finite(s) | s <= 0))
-      if (length(bad) > 0L) {
-        warning(sprintf("Dispersion is zero or not computable (constant or single-value series) in column(s) %s. Scale set to 1 to avoid zero division.",
-                        private$col_labels(x, bad)), call. = FALSE)
-        s[bad] <- 1
-      }
+      # Disabled steps become no-ops: center -> 0, scale -> 1
+      if (!private$.center) mu <- rep(0, p)
 
       # All-NA columns stay NA
       mu[all_na] <- NA_real_
       s[all_na]  <- NA_real_
 
-      z <- sweep(sweep(x, 2, mu, "-"), 2, s, "/")
-      list(x_norm = z, attr = list(mu = mu, s = s))
+      attr <- list(mu = mu, s = s)
+      list(x_norm = private$apply_z_score(x, attr), attr = attr)
     },
 
     # Apply pre-computed z-score parameters to a numeric matrix.
@@ -152,21 +164,21 @@ Normalizer <- R6::R6Class(
         mx[const] <- mn[const] + 1
       }
 
-      z <- sweep(sweep(x, 2, mn, "-"), 2, mx - mn, "/")
+      z <- 2 * sweep(sweep(x, 2, mn, "-"), 2, mx - mn, "/") - 1
       list(x_norm = z, attr = list(lo = mn, hi = mx))
     },
 
     # Apply pre-computed min-max bounds.
     apply_min_max = function(x, attr) {
       private$check_attr(x, attr, c("lo", "hi"))
-      z <- sweep(sweep(x, 2, attr$lo, "-"), 2, attr$hi - attr$lo, "/")
+      z <- 2 * sweep(sweep(x, 2, attr$lo, "-"), 2, attr$hi - attr$lo, "/") - 1
       return(z)
     },
 
     # Invert min-max normalization.
     from_min_max = function(z, attr) {
       private$check_attr(z, attr, c("lo", "hi"))
-      x <- sweep(sweep(z, 2, attr$hi - attr$lo, "*"), 2, attr$lo, "+")
+      x <- sweep(sweep((z + 1) / 2, 2, attr$hi - attr$lo, "*"), 2, attr$lo, "+")
       return(x)
     },
 
@@ -194,11 +206,22 @@ Normalizer <- R6::R6Class(
     #' @param method Method used by the API: `"z_score"` (default) or `"min_max"`.
     #' @param robust Logical; for `"z_score"` use median/MAD instead of mean/standard deviation (default `FALSE`).
     #' @return Invisibly returns `self`.
-    initialize = function(method = c("z_score", "min_max"), robust = FALSE) {
-      if (!is.logical(robust) || length(robust) != 1L || is.na(robust)) stop("'robust' must be TRUE or FALSE.", call. = FALSE)
+    #' @param center Logical; for `"z_score"`, subtract the column mean (median if
+    #'   `robust = TRUE`). If `FALSE`, no centering is done (default `TRUE`).
+    #' @param scale Logical; for `"z_score"`, divide by the column standard deviation
+    #'   (MAD if `robust = TRUE`). If `FALSE`, no scaling is done (default `TRUE`).
+    initialize = function(method = c("z_score", "min_max"), robust = FALSE,
+                          center = TRUE, scale = TRUE) {
+      flag <- function(v, nm) if (!is.logical(v) || length(v) != 1L || is.na(v)) stop(sprintf("'%s' must be TRUE or FALSE.", nm), call. = FALSE)
+      flag(robust, "robust"); flag(center, "center"); flag(scale, "scale")
 
       private$.method <- match.arg(method)
       private$.robust <- robust
+      private$.center <- center
+      private$.scale  <- scale
+
+      if (private$.method == "min_max" && (!center || !scale))
+        warning("'center' and 'scale' are ignored when method = \"min_max\".", call. = FALSE)
 
       invisible(self)
     },
